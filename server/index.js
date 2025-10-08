@@ -1,8 +1,8 @@
 import express from 'express'
 import cors from 'cors'
+import dotenv from 'dotenv'
 import fs from 'fs'
 import path from 'path'
-import dotenv from 'dotenv'
 import { fileURLToPath } from 'url'
 import { fetchActiveVariants, updateVariantPrice } from './shopify.js'
 
@@ -20,7 +20,7 @@ for (const dir of [DATA_DIR, BACKUP_DIR, LOG_DIR]) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
 }
 
-// Round helpers (inline to keep server independent)
+// --- rounding logic
 function roundTo00or90(n) {
   if (n <= 0) return 0
   const x = Math.round(Number(n))
@@ -35,9 +35,7 @@ function roundTo00or90(n) {
   let best = cand[0], bestD = Math.abs(x - cand[0])
   for (let i = 1; i < cand.length; i++) {
     const d = Math.abs(x - cand[i])
-    if (d < bestD || (d === bestD && cand[i] > best)) {
-      best = cand[i]; bestD = d
-    }
+    if (d < bestD || (d === bestD && cand[i] > best)) { best = cand[i]; bestD = d }
   }
   return best
 }
@@ -54,34 +52,30 @@ function computeNew(p, pct) {
   return { newPrice, newCompare }
 }
 
-let lastPreview = [] // cached preview rows
-
+// PREVIEW
 app.post('/api/run/preview', async (req, res) => {
   try {
     const pct = Number(req.body.pct || 0)
-    const variants = await fetchActiveVariants()
-    const rows = variants.map(v => {
-      const { newPrice, newCompare } = computeNew(v, pct)
-      return { ...v, newPrice, newCompare }
-    })
-    lastPreview = rows
+    const variants = await fetchActiveVariants() // mock or live
+    const rows = variants.map(v => ({ ...v, ...computeNew(v, pct) }))
     res.json({ rows })
   } catch (e) {
-    res.status(500).send(e.message)
+    console.error('Preview error:', e)
+    res.status(500).send(e.message || 'Server error')
   }
 })
 
-// Creates a JSON backup for the last preview set (safety-before-write)
+// BACKUP (uses last preview from live fetch each time for safety)
+let lastPreview = []
 app.post('/api/run/backup', async (req, res) => {
   try {
-    if (!lastPreview.length) {
-      return res.status(400).send('Run preview first.')
-    }
+    const pct = Number(req.body.pct || 0)
+    const variants = await fetchActiveVariants()
+    lastPreview = variants.map(v => ({ ...v, ...computeNew(v, pct) }))
     const ts = new Date().toISOString().replace(/[:.]/g, '-')
     const backupId = `backup-${ts}.json`
     const backupPath = path.join(BACKUP_DIR, backupId)
-    // store the ORIGINAL values per variant (for rollback)
-    const min = lastPreview.map(r => ({
+    const minimal = variants.map(r => ({
       product_id: r.product_id,
       product_title: r.product_title,
       variant_id: r.variant_id,
@@ -89,49 +83,49 @@ app.post('/api/run/backup', async (req, res) => {
       price: r.price,
       compare_at_price: r.compare_at_price
     }))
-    fs.writeFileSync(backupPath, JSON.stringify({ created_at: new Date().toISOString(), items: min }, null, 2))
-    res.json({ backupId, items: min.length })
+    fs.writeFileSync(backupPath, JSON.stringify({ created_at: new Date().toISOString(), items: minimal }, null, 2))
+    res.json({ backupId, items: minimal.length })
   } catch (e) {
-    res.status(500).send(e.message)
+    res.status(500).send(e.message || 'Backup failed')
   }
 })
 
-// Apply updates using current preview (requires a backupId that was just created)
+// APPLY
 app.post('/api/run/apply', async (req, res) => {
   const pct = Number(req.body.pct || 0)
   const { backupId } = req.body
   const log = []
   if (!backupId) return res.status(400).send('backupId required.')
-  if (!lastPreview.length) return res.status(400).send('Run preview first.')
-  const backupPath = path.join(BACKUP_DIR, backupId)
-  if (!fs.existsSync(backupPath)) return res.status(400).send('Backup not found.')
 
   let updated = 0, skipped = 0, errors = 0
-  for (const r of lastPreview) {
-    try {
-      if (r.price <= 0) { skipped++; log.push(`Skip ${r.variant_id}: non-positive price`); continue }
-      // compute again to be certain with pct passed now
-      const { newPrice, newCompare } = computeNew(r, pct)
-      await updateVariantPrice(r.variant_id, { price: newPrice, compare_at_price: newCompare })
-      updated++
-      log.push(`OK ${r.variant_id}: ${r.price}→${newPrice}` + (r.compare_at_price != null ? ` | compare ${r.compare_at_price}→${newCompare}` : ''))
-      // Gentle delay to respect rate limits (tune as needed)
-      await new Promise(s => setTimeout(s, 120))
-    } catch (e) {
-      errors++
-      log.push(`ERR ${r.variant_id}: ${e.message}`)
+  try {
+    if (!lastPreview.length) {
+      // safety: recompute if preview cache is empty
+      const variants = await fetchActiveVariants()
+      lastPreview = variants.map(v => ({ ...v, ...computeNew(v, pct) }))
     }
+    for (const r of lastPreview) {
+      try {
+        if (r.price <= 0) { skipped++; log.push(`Skip ${r.variant_id}: non-positive price`); continue }
+        await updateVariantPrice(r.variant_id, { price: r.newPrice, compare_at_price: r.newCompare })
+        updated++
+        log.push(`OK ${r.variant_id}: ${r.price}→${r.newPrice}` + (r.compare_at_price != null ? ` | compare ${r.compare_at_price}→${r.newCompare}` : ''))
+        await new Promise(s => setTimeout(s, 120)) // respect rate limits
+      } catch (e) {
+        errors++; log.push(`ERR ${r.variant_id}: ${e.message}`)
+      }
+    }
+  } catch (e) {
+    return res.status(500).send(e.message || 'Apply failed')
   }
 
-  // Save run log
   const ts = new Date().toISOString().replace(/[:.]/g, '-')
   const logPath = path.join(LOG_DIR, `run-${ts}.log.json`)
   fs.writeFileSync(logPath, JSON.stringify({ started_at: ts, pct, backupId, updated, skipped, errors, lines: log }, null, 2))
-
   res.json({ summary: { updated, skipped, errors }, log })
 })
 
-// Rollback from a backup JSON
+// ROLLBACK
 app.post('/api/run/rollback', async (req, res) => {
   const { backupId } = req.body
   if (!backupId) return res.status(400).send('backupId required.')
@@ -144,17 +138,13 @@ app.post('/api/run/rollback', async (req, res) => {
   for (const r of items) {
     try {
       await updateVariantPrice(r.variant_id, { price: r.price, compare_at_price: r.compare_at_price ?? null })
-      updated++
-      log.push(`RESTORE ${r.variant_id}: price=${r.price}` + (r.compare_at_price != null ? `, compare=${r.compare_at_price}` : ''))
+      updated++; log.push(`RESTORE ${r.variant_id}: price=${r.price}` + (r.compare_at_price != null ? `, compare=${r.compare_at_price}` : ''))
       await new Promise(s => setTimeout(s, 120))
     } catch (e) {
-      errors++
-      log.push(`ERR RESTORE ${r.variant_id}: ${e.message}`)
+      errors++; log.push(`ERR RESTORE ${r.variant_id}: ${e.message}`)
     }
   }
   res.json({ summary: { updated, errors }, log })
 })
 
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`)
-})
+app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`))
