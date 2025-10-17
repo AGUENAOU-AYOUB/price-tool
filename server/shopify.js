@@ -2,35 +2,58 @@ import fetch from 'node-fetch'
 import dotenv from 'dotenv'
 dotenv.config()
 
-const API_VER = '2024-10'
+const API_VER = '2025-01' // matches your store response
 const STORE = process.env.SHOPIFY_STORE
 const TOKEN = process.env.SHOPIFY_ADMIN_TOKEN
-
-// If env missing, return mock data so UI works immediately.
 const MOCK = !STORE || !TOKEN
 
 export async function fetchActiveVariants() {
   if (MOCK) {
     console.warn('[MOCK MODE] Missing SHOPIFY_STORE or SHOPIFY_ADMIN_TOKEN. Returning sample data.')
     return [
-      { product_id: 1, product_title: 'Sample A', handle: 'a', variant_id: 11, variant_title: 'Default', sku: 'A', price: 1500, compare_at_price: 1790 },
-      { product_id: 2, product_title: 'Sample B', handle: 'b', variant_id: 22, variant_title: 'Large',   sku: 'B', price: 990,  compare_at_price: null }
+      // mock chain product
+      {
+        product_id: 1, product_title: 'Bracelet Aurora En Or 18K', handle: 'aurora',
+        product_tags: 'jewelry', product_option_names: ['Chain Variants'],
+        variant_id: 11, variant_title: 'Forsat S', position: 1, sku: 'A-S', price: 1500, compare_at_price: 1550
+      },
+      {
+        product_id: 1, product_title: 'Bracelet Aurora En Or 18K', handle: 'aurora',
+        product_tags: 'jewelry', product_option_names: ['Chain Variants'],
+        variant_id: 12, variant_title: 'Forsat M', position: 2, sku: 'A-M', price: 1650, compare_at_price: 1550
+      }
     ]
   }
+
   const base = `https://${STORE}/admin/api/${API_VER}`
-  let url = `${base}/products.json?status=active&limit=250&fields=id,title,handle,variants`
+  let url = `${base}/products.json?status=active&limit=250&fields=id,title,handle,tags,options,variants`
   const out = []
+
   while (url) {
-    const res = await fetch(url, { headers: { 'X-Shopify-Access-Token': TOKEN, 'Content-Type': 'application/json' } })
+    const res = await fetch(url, {
+      headers: {
+        'X-Shopify-Access-Token': TOKEN,
+        'Content-Type': 'application/json'
+      }
+    })
     if (!res.ok) throw new Error(`Shopify fetch failed: ${res.status} ${await res.text()}`)
     const data = await res.json()
-    for (const p of data.products || []) {
-      for (const v of p.variants || []) {
+    for (const p of (data.products || [])) {
+      const optionNames = (p.options || []).map(o => o.name)
+      const tags = p.tags || ''
+      for (const v of (p.variants || [])) {
         out.push({
-          product_id: p.id, product_title: p.title, handle: p.handle,
-          variant_id: v.id, variant_title: v.title, sku: v.sku,
+          product_id: p.id,
+          product_title: p.title,
+          handle: p.handle,
+          product_tags: tags,
+          product_option_names: optionNames,
+          variant_id: v.id,
+          variant_title: v.title,
+          position: v.position,
+          sku: v.sku,
           price: Number(v.price),
-          compare_at_price: v.compare_at_price != null ? Number(v.compare_at_price) : null,
+          compare_at_price: v.compare_at_price != null ? Number(v.compare_at_price) : null
         })
       }
     }
@@ -41,12 +64,10 @@ export async function fetchActiveVariants() {
 }
 
 export async function updateVariantPrice(variantId, { price, compare_at_price }) {
-  if (MOCK) {
-    // mock update (no-op) so Apply/Rollback work without a token
-    return
-  }
+  if (MOCK) return
   const base = `https://${STORE}/admin/api/${API_VER}`
-  const body = { variant: { id: variantId, price: String(price) } }
+  const body = { variant: { id: variantId } }
+  if (price != null) body.variant.price = String(price)
   if (compare_at_price != null) body.variant.compare_at_price = String(compare_at_price)
 
   const res = await fetch(`${base}/variants/${variantId}.json`, {
